@@ -1,0 +1,395 @@
+---
+title: "16S EMOSE workflow comparison"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+editor_options: 
+  chunk_output_type: console
+---
+
+# Introduction
+Here we will explore the differences between three different pipelines to analyse the data produced in EMOSE. The workflows are:
+
+- Jed Fuhrman's lab protocol (**jedpipe**)
+- DADA2 protocol (**dada2**)
+- UPARSE99 protocol (**uparse99**)
+
+
+# Data exploration
+
+First we will do a basic data exploration to check the number of OTUs/ASVs and sequences each approach is able to recover.
+
+
+We will load the basic libraries and functions:
+
+```{r libraries, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(ShortRead)
+
+source("lib/functions.R")
+```
+
+## Reading abundance tables
+
+We will read the abundance tables for the **UPARSE99** workflow:
+
+```{r read_table_uparse99, warning=FALSE, message=FALSE}
+uparse99_otutable <-
+  read_tsv(file = "data/16S/EMOSE_MetaB16V4V5_nosizing_otutable_uparse99.tsv.gz",
+  col_names = TRUE,
+  trim_ws = TRUE) %>%
+  dplyr::rename(id = OTUId)
+  colnames(uparse99_otutable) <-
+  gsub("-", "", colnames(uparse99_otutable))
+
+uparse99_otutable <- uparse99_otutable[rowSums(uparse99_otutable[,2:ncol(uparse99_otutable)]) > 0, ]
+```
+
+Then for **JEDPIPE** workflow:
+
+```{r read_table_jedpipe, warning=FALSE, message=FALSE, cache = TRUE}
+jedpipe_otutable <-
+  read_tsv(file = "data/16S/EMOSE_MetaB16V4V5_nosizing_otutable_jedpipe.tsv.gz",
+  col_names = TRUE,
+  trim_ws = TRUE) %>%
+  select(-taxonomy,-in.silico.even,-in.silico.stag) %>%
+  dplyr::rename(id = `OTU ID`)
+
+jedpipe_otutable <- jedpipe_otutable[rowSums(jedpipe_otutable[,2:ncol(jedpipe_otutable)]) > 0, ]
+```
+
+And finally for **DADA2**:
+
+```{r read_table_dada2, warning=FALSE, message=FALSE}
+dada2_otutable <-
+  read_csv(
+  file = "data/16S/EMOSE_MetaB16V4V5_nosizing_otutable_dada2.csv.gz",
+  col_names = TRUE,
+  trim_ws = TRUE,
+  comment = '#'
+  ) %>%
+  select(-Kingdom, -Phylum, -Class, -Order, -Family, -Genus)
+  colnames(dada2_otutable) <-
+  gsub("-515yF-926R", "", colnames(dada2_otutable))
+
+dada2_otutable <- dada2_otutable[rowSums(dada2_otutable[,2:ncol(dada2_otutable)]) > 0, ]
+```
+ 
+We also will export the DADA2 sequence names to a FASTA file:
+ 
+```{r save_fasta_dada2, warning=FALSE, message=FALSE}
+writeFasta(
+   object = ShortRead(
+    sread = DNAStringSet(
+      dada2_otutable %>%
+        gather(label, counts,-id) %>%
+        select(id) %>%
+        dplyr::rename(sequence = id) %>%
+        unique %>%
+        mutate(sequence = tolower(sequence)) %>%
+        .$sequence
+    ),
+   id = BStringSet(
+    dada2_otutable %>%
+      gather(label, counts,-id) %>%
+      select(id) %>%
+      dplyr::rename(sequence = id) %>%
+      unique %>%
+      mutate(sequence = tolower(sequence)) %>%
+      .$sequence
+    )
+   ),
+   file = "data/16S/EMOSE_MetaB16V4V5_nosizing_repseq_dada2.fasta",
+   mode = "w",
+   width = 2000
+)
+```
+
+## Summarising tables
+
+Time to have a look at the data. First we will summarise the abundance tables:
+
+Number of OTUs/ASVs and samples
+```{r count_otus, warning=FALSE, message=FALSE}
+methods <- c( "jedpipe", "uparse99", "dada2")
+names(methods) <- methods
+tables <- list(jedpipe_otutable, uparse99_otutable, dada2_otutable)
+names(tables) <- methods
+
+notus <- map_df(tables, number_of_otus_samples, .id = "method") %>%
+  mutate(method = factor(method, levels = methods))
+
+ggplot(notus, aes(method, n_otus)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(trans = "log10", labels = scales::comma, breaks = c(10, 100, 1000, 10000, 100000, 1000000, 10000000)) +
+  theme_light() +
+  xlab("") +
+  ylab("# OTU/ASV (log10)")
+```
+
+```{r show_table}
+knitr::kable(notus, caption = "Number of OTUs/ASVs and samples in each method")
+```
+
+## Filtering abundance tables
+
+We will filter the absolute singletons (OTUs/ASVs with only one counts) and also filter for low count ones (mean proportion >= 1e-5):
+
+```{r summary_tables, cache=TRUE}
+method_summary <- plyr::ldply(tables, get_summary, .id = "method") %>%
+  tbl_df()
+
+readsXsample <- method_summary %>%
+  group_by(method, label) %>%
+  dplyr::summarise(N = sum(counts)) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+otuXsample <- method_summary %>%
+  ungroup() %>%
+  select(method, label,id) %>%
+  group_by(method, label) %>%
+  summarise(N = n()) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+readsXmethod <- readsXsample %>%
+  ungroup() %>%
+  group_by(method) %>%
+  summarise(N = sum(N)) %>%
+  mutate(method = factor(method, levels = methods))
+
+# Distribution of absolute singletons per sample
+methods_prevalence <- method_summary %>%
+  dplyr::select(method,label,id, counts) %>%
+  dplyr::group_by(method, id) %>%
+  summarise(prev = sum(counts > 0), total_counts = sum(counts))
+
+methods_abs_singletons <- methods_prevalence %>%
+  dplyr::filter(total_counts <= 1, prev <= 1) %>%
+  unite(comb, method, id, remove = FALSE)
+
+methods_abun_singletons <- methods_prevalence %>%
+  dplyr::filter(total_counts > 1, prev <= 1)
+
+# Remove absolute singletons
+methods_prevalence <- methods_prevalence %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  filter(!(comb %in% methods_abs_singletons$comb)) %>%
+  select(-comb)
+
+otuXsample_filt_beta_ids <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  filter(!(comb %in% methods_abs_singletons$comb)) %>%
+  group_by(method) %>%
+  mutate(n_samples = length(unique(label))) %>%
+  ungroup() %>%
+  group_by(method, label) %>%
+  mutate(rel_abun = counts/sum(counts)) %>%
+  ungroup() %>%
+  select(method, id, rel_abun, n_samples, comb) %>%
+  group_by(method, id) %>%
+  mutate(rel_abun_overall = sum(rel_abun)) %>%
+  mutate(tax_mean = rel_abun_overall/n_samples) %>%
+  select(-rel_abun) %>%
+  unique() %>%
+  filter(tax_mean >= 1e-5) %>%
+  ungroup()
+
+
+readsXmethod <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  select(method, label,id, counts) %>%
+  group_by(method) %>%
+  summarise(N = sum(counts)) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+readsXmethod_filt <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  filter(!(comb %in% methods_abs_singletons$comb)) %>%
+  select(method, label,id, counts) %>%
+  group_by(method) %>%
+  summarise(N = sum(counts)) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+readsXmethod_filt_beta <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  filter((comb %in% (otuXsample_filt_beta_ids %>% unite(comb, method, id, remove = FALSE) %>% .$comb))) %>%
+  select(method, label,id, counts) %>%
+  group_by(method) %>%
+  summarise(N = sum(counts)) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+readsXsample <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  select(method, label,id, counts) %>%
+  group_by(method, label) %>%
+  summarise(N = sum(counts)) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+readsXsample_filt <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  filter(!(comb %in% methods_abs_singletons$comb)) %>%
+  select(method, label,id, counts) %>%
+  group_by(method, label) %>%
+  summarise(N = sum(counts)) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+readsXsample_filt_beta <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  filter((comb %in% (otuXsample_filt_beta_ids %>% unite(comb, method, id, remove = FALSE) %>% .$comb))) %>%
+  select(method, label,id, counts) %>%
+  group_by(method, label) %>%
+  summarise(N = sum(counts)) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+otuXmethod <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  select(method, comb) %>%
+  unique() %>%
+  group_by(method) %>%
+  summarise(N = n()) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+otuXmethod_filt <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  select(method, comb) %>%
+  unique() %>%
+  filter(!(comb %in% methods_abs_singletons$comb)) %>%
+  group_by(method) %>%
+  summarise(N = n()) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+
+otuXmethod_filt_beta <- method_summary %>%
+  ungroup() %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  select(method, comb) %>%
+  unique() %>%
+  filter((comb %in% (otuXsample_filt_beta_ids %>% unite(comb, method, id, remove = FALSE) %>% .$comb))) %>%
+  group_by(method) %>%
+  summarise(N = n()) %>%
+  ungroup() %>%
+  mutate(method = factor(method, levels = methods))
+```
+## Plotting summaries
+
+### Reads per method
+
+```{r plot_reads_method}
+ggplot(bind_rows(readsXmethod %>% mutate(class = "Raw"),
+                 readsXmethod_filt %>% mutate(class = "Post"),
+                 readsXmethod_filt_beta %>% mutate(class = "Beta")) %>% mutate(class = fct_rev(class)), aes(method, N, fill = class)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_light() +
+  xlab("") +
+  ylab("# counts")
+```
+
+### Reads per sample
+
+```{r plot_reads_sample, fig.width=14, fig.height=7}
+ggplot(bind_rows(readsXsample %>% mutate(class = "Raw"),
+                 readsXsample_filt %>% mutate(class = "Post"),
+                 readsXsample_filt_beta %>% mutate(class = "Beta")) %>% mutate(class = fct_rev(class)), aes(label, N, fill = class)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~method, ncol = 1) +
+  scale_y_continuous(labels = scales::comma) +
+  theme_light() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6)) +
+  xlab("") +
+  ylab("# counts")
+```
+
+### OTU/ASVs per method
+
+```{r plot_otu_sample}
+ggplot(bind_rows(otuXmethod %>% mutate(class = "Raw"),
+                 otuXmethod_filt %>% mutate(class = "Post"),
+                 otuXmethod_filt_beta %>% mutate(class = "Beta")) %>% mutate(class = fct_rev(class)), aes(method, N, fill = class)) +
+  geom_col(position = "dodge") +
+  scale_y_log10(labels = scales::comma) +
+  theme_light() +
+  xlab("") +
+  ylab("# OTUs/ASVs")
+```
+
+# Mock communities comparison
+
+We will compare the mock communities to the ones used in (Parada et al. 2016)[https://onlinelibrary.wiley.com/doi/abs/10.1111/1462-2920.13023]. First we will export the sequence IDs from the mock community samples (ERR2098507 and ERR2098508):
+
+```{r}
+mock_coms <- method_summary %>%
+  unite(comb, method, id, remove = FALSE) %>%
+  #filter(comb %in% (methods_prevalence %>% unite(comb, method, id, remove = FALSE) %>% .$comb), (label == "ERR2098507" | label == "ERR2098508")) %>%
+  filter((label == "ERR2098507" | label == "ERR2098508")) %>%
+  select(-comb)
+
+for (i in methods){
+  ids <- mock_coms %>%
+    filter(method == i, label == "ERR2098507") %>%
+    mutate(id = ifelse(method == "dada2", tolower(id), id)) %>%
+    select(id) %>%
+    unique()
+  fname <- file.path("data/comparisons_mock", paste(i, "_mock_ids_even.txt", sep = ""))
+  write_tsv(ids, path = fname, col_names = FALSE)
+}
+
+for (i in methods){
+  ids <- mock_coms %>%
+    filter(method == i, label == "ERR2098508") %>%
+    mutate(id = ifelse(method == "dada2", tolower(id), id)) %>%
+    select(id) %>%
+    unique()
+  fname <- file.path("data/comparisons_mock", paste(i, "_mock_ids_stag.txt", sep = ""))
+  write_tsv(ids, path = fname, col_names = FALSE)
+}
+```
+
+```{bash}
+for M in uparse99 jedpipe dada2; do 
+  filterbyname.sh in=../16S/EMOSE_MetaB16V4V5_nosizing_repseq_"${M}".fasta.gz \
+  out=${M}_mock_even.fasta names=${M}_mock_ids_even.txt include=t overwrite=t; 
+done
+for M in uparse99 jedpipe dada2; do 
+  filterbyname.sh in=../16S/EMOSE_MetaB16V4V5_nosizing_repseq_"${M}".fasta.gz \
+  out=${M}_mock_stag.fasta names=${M}_mock_ids_stag.txt include=t overwrite=t; 
+done
+```
+
+```{bash}
+for M in uparse99 jedpipe dada2; do 
+  usearch10.0.240_i86osx32 -usearch_local ${M}_mock_even.fasta \
+  -db ../mock/references_even_mock_noprimers.fasta  -strand both -id 0.5 \
+  -blast6out ${M}_vs_even.tsv -target_cov 0.5; 
+done
+for M in uparse99 jedpipe dada2; do 
+  usearch10.0.240_i86osx32 -usearch_local ${M}_mock_stag.fasta \
+  -db ../mock/references_staggered_mock_noprimers.fasta -strand both -id 0.5 \
+  -blast6out ${M}_vs_stag.tsv -target_cov 0.5; 
+done
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
